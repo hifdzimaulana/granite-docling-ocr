@@ -37,6 +37,13 @@ def pdf_page_to_image(pdf_path: str, page_num: int, dpi: int = 150) -> Image.Ima
     page = doc.load_page(page_num)
     mat = fitz.Matrix(dpi / 72, dpi / 72)
     pix = page.get_pixmap(matrix=mat)
+
+    if pix.width == 0 or pix.height == 0 or len(pix.samples) == 0:
+        doc.close()
+        raise ValueError(
+            f"Page {page_num + 1} has no renderable content (empty or blank page)"
+        )
+
     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     doc.close()
     return img
@@ -89,7 +96,13 @@ def process_pdf(pdf_path: str, custom_prompt: str = None) -> str:
 
     for i, text in enumerate(raw_texts):
         print(f"Processing page {i + 1}/{len(raw_texts)}...")
-        img = pdf_page_to_image(pdf_path, i)
+
+        try:
+            img = pdf_page_to_image(pdf_path, i)
+        except ValueError as e:
+            print(f"Skipping page {i + 1}: {e}")
+            results.append(f"<!-- Page {i + 1}: Empty/blank page -->")
+            continue
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
             img.save(tmp.name)
