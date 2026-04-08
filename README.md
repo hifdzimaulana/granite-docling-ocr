@@ -23,11 +23,20 @@ pip install -r requirements.txt
 
 ## Usage
 
-Set the model path (download from [MLX Granite Docling](https://huggingface.co/ibm/granite-vision-llm-v2.0-3b-mlx)):
+Copy `.env.example` to `.env` and update `MODEL_PATH` to your model location:
 
 ```bash
-export MODEL_PATH=/path/to/granite-vision-llm-v2.0-3b-mlx
-python backend.py
+cp .env.example .env
+# Edit .env with your model path
+```
+
+Manage the server:
+
+```bash
+./server.sh start    # Start server
+./server.sh status   # Check if running
+./server.sh stop     # Stop server
+./server.sh restart  # Restart server
 ```
 
 Server runs at `http://localhost:8080`

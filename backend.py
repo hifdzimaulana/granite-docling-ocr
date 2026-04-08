@@ -19,6 +19,12 @@ from transformers.image_utils import load_image
 
 DEFAULT_PROMPT = "Convert this page to docling."
 
+MODEL_PATH = os.environ.get("MODEL_PATH")
+if not MODEL_PATH:
+    print("ERROR: MODEL_PATH environment variable not set")
+    print("Set it with: export MODEL_PATH=/path/to/model")
+    sys.exit(1)
+
 model = None
 processor = None
 config = None
