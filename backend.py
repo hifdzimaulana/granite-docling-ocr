@@ -28,6 +28,8 @@ if not MODEL_PATH:
 model = None
 processor = None
 config = None
+active_jobs = {}
+cancel_flags = {}
 
 
 def init_model():
@@ -65,9 +67,9 @@ def extract_text_from_pdf(pdf_path: str) -> list[str]:
     return texts
 
 
-def process_image(
-    image_path: str, context_text: str = None, custom_prompt: str = None
-) -> str:
+def process_image_stream(
+    job_id: str, image_path: str, context_text: str = None, custom_prompt: str = None
+):
     pil_image = load_image(image_path)
 
     base_prompt = custom_prompt if custom_prompt else DEFAULT_PROMPT
@@ -84,30 +86,63 @@ Preserve accurate text from the raw extraction above while enriching with visual
     formatted_prompt = apply_chat_template(processor, config, prompt, num_images=1)
 
     output = ""
+    chunk = ""
     for token in stream_generate(
         model, processor, formatted_prompt, [pil_image], max_tokens=4096, verbose=False
     ):
+        if cancel_flags.get(job_id):
+            return None
+
         output += token.text
+        chunk += token.text
+
+        if len(chunk) >= 50:
+            yield chunk
+            chunk = ""
+
         if "</doctag>" in token.text:
             break
+
+    if chunk:
+        yield chunk
 
     doctags_doc = DocTagsDocument.from_doctags_and_image_pairs([output], [pil_image])
     doc = DoclingDocument.load_from_doctags(doctags_doc, document_name="Document")
     return doc.export_to_markdown()
 
 
-def process_pdf(pdf_path: str, custom_prompt: str = None) -> str:
+def process_image(
+    image_path: str, context_text: str = None, custom_prompt: str = None
+) -> str:
+    result = None
+    for chunk in process_image_stream(None, image_path, context_text, custom_prompt):
+        if chunk is None:
+            return ""
+        result = chunk
+    return result or ""
+
+
+def process_pdf_stream(job_id: str, pdf_path: str, custom_prompt: str = None):
     raw_texts = extract_text_from_pdf(pdf_path)
+    total_pages = len(raw_texts)
     results = []
 
     for i, text in enumerate(raw_texts):
-        print(f"Processing page {i + 1}/{len(raw_texts)}...")
+        if cancel_flags.get(job_id):
+            yield {"type": "cancelled", "data": "".join(results)}
+            return
+
+        yield {"type": "progress", "data": f"Processing page {i + 1}/{total_pages}..."}
 
         try:
             img = pdf_page_to_image(pdf_path, i)
         except ValueError as e:
             print(f"Skipping page {i + 1}: {e}")
             results.append(f"<!-- Page {i + 1}: Empty/blank page -->")
+            yield {
+                "type": "page_done",
+                "data": f"<!-- Page {i + 1}: Empty/blank page -->",
+            }
             continue
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
@@ -115,19 +150,44 @@ def process_pdf(pdf_path: str, custom_prompt: str = None) -> str:
             tmp_path = tmp.name
 
         try:
-            markdown = process_image(
-                tmp_path, context_text=text, custom_prompt=custom_prompt
-            )
+            page_result = []
+            for chunk in process_image_stream(
+                job_id, tmp_path, context_text=text, custom_prompt=custom_prompt
+            ):
+                if chunk is None:
+                    yield {"type": "cancelled", "data": "".join(results)}
+                    return
+                page_result.append(chunk)
+
+            markdown = "".join(page_result)
             results.append(markdown)
+            yield {"type": "page_done", "data": markdown}
         finally:
             os.unlink(tmp_path)
 
-    return "\n\n---\n\n".join(results)
+    final_result = "\n\n---\n\n".join(results)
+    yield {"type": "done", "data": final_result}
+
+
+def process_pdf(pdf_path: str, custom_prompt: str = None) -> str:
+    result = ""
+    for event in process_pdf_stream(None, pdf_path, custom_prompt):
+        if event["type"] == "done":
+            result = event["data"]
+    return result
 
 
 class OCRHandler(BaseHTTPRequestHandler):
     def do_POST(self):
-        if self.path != "/api/ocr":
+        if self.path == "/api/ocr/stream":
+            self._handle_stream()
+            return
+        elif self.path == "/api/ocr/cancel":
+            self._handle_cancel()
+            return
+        elif self.path == "/api/ocr":
+            pass
+        else:
             self.send_error(404, "Not found")
             return
 
@@ -223,6 +283,164 @@ class OCRHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(response).encode())
+
+    def _handle_stream(self):
+        import uuid
+
+        content_type = self.headers.get("Content-Type", "")
+        if "multipart/form-data" not in content_type:
+            self.send_error(400, "Expected multipart/form-data")
+            return
+
+        content_length = int(self.headers.get("Content-Length", 0))
+        boundary = (
+            content_type.split("boundary=")[1] if "boundary=" in content_type else None
+        )
+
+        if not boundary:
+            self.send_error(400, "No boundary found")
+            return
+
+        body = self.rfile.read(content_length)
+        parts = body.split(f"--{boundary}".encode())
+
+        file_data = None
+        filename = None
+        custom_prompt = None
+        for part in parts:
+            if b"Content-Disposition" in part:
+                if b'name="prompt"' in part:
+                    header_end = part.find(b"\r\n\r\n")
+                    if header_end != -1:
+                        prompt_data = part[header_end + 4 :].strip()
+                        if prompt_data and not prompt_data.startswith(b"------"):
+                            custom_prompt = prompt_data.decode(
+                                "utf-8", errors="ignore"
+                            ).strip()
+                elif b"filename=" in part:
+                    name_start = part.find(b'filename="')
+                    if name_start != -1:
+                        name_start += 10
+                        name_end = part.find(b'"', name_start)
+                        filename = part[name_start:name_end].decode()
+                    if (
+                        b"Content-Type: image/" in part
+                        or b"Content-Type: application/pdf" in part
+                    ):
+                        header_end = part.find(b"\r\n\r\n")
+                        if header_end != -1:
+                            file_data = part[header_end + 4 :]
+                            break
+
+        if not file_data:
+            self.send_error(400, "No file found")
+            return
+
+        job_id = str(uuid.uuid4())
+        cancel_flags[job_id] = False
+        is_pdf = filename and filename.lower().endswith(".pdf")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Job-ID", job_id)
+        self.end_headers()
+
+        try:
+            if is_pdf:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                    tmp.write(file_data)
+                    tmp_path = tmp.name
+
+                try:
+                    for event in process_pdf_stream(
+                        job_id, tmp_path, custom_prompt=custom_prompt
+                    ):
+                        if cancel_flags.get(job_id):
+                            self.wfile.write(
+                                f"event: cancelled\ndata: {json.dumps({'markdown': event.get('data', '')})}\n\n".encode()
+                            )
+                            self.wfile.flush()
+                            break
+                        if event["type"] == "progress":
+                            self.wfile.write(
+                                f"event: progress\ndata: {json.dumps({'message': event['data']})}\n\n".encode()
+                            )
+                            self.wfile.flush()
+                        elif event["type"] in ["page_done", "done", "cancelled"]:
+                            self.wfile.write(
+                                f"event: {event['type']}\ndata: {json.dumps({'markdown': event['data']})}\n\n".encode()
+                            )
+                            self.wfile.flush()
+                finally:
+                    os.unlink(tmp_path)
+            else:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+                    tmp.write(file_data)
+                    tmp_path = tmp.name
+
+                try:
+                    self.wfile.write(
+                        f"event: progress\ndata: {json.dumps({'message': 'Processing image...'})}\n\n".encode()
+                    )
+                    self.wfile.flush()
+
+                    accumulated = ""
+                    for chunk in process_image_stream(
+                        job_id, tmp_path, custom_prompt=custom_prompt
+                    ):
+                        if chunk is None:
+                            self.wfile.write(
+                                f"event: cancelled\ndata: {json.dumps({'markdown': accumulated})}\n\n".encode()
+                            )
+                            self.wfile.flush()
+                            break
+                        accumulated += chunk
+                        self.wfile.write(
+                            f"event: chunk\ndata: {json.dumps({'markdown': chunk})}\n\n".encode()
+                        )
+                        self.wfile.flush()
+
+                    if not cancel_flags.get(job_id):
+                        self.wfile.write(
+                            f"event: done\ndata: {json.dumps({'markdown': accumulated})}\n\n".encode()
+                        )
+                        self.wfile.flush()
+                finally:
+                    os.unlink(tmp_path)
+        except Exception as e:
+            import traceback
+
+            traceback.print_exc()
+            self.wfile.write(
+                f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n".encode()
+            )
+            self.wfile.flush()
+        finally:
+            del cancel_flags[job_id]
+
+    def _handle_cancel(self):
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
+        try:
+            data = json.loads(body.decode())
+            job_id = data.get("jobId")
+            if job_id and job_id in cancel_flags:
+                cancel_flags[job_id] = True
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": True}).encode())
+            else:
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps({"success": False, "error": "Job not found"}).encode()
+                )
+        except:
+            self.send_error(400, "Invalid request")
 
     def do_GET(self):
         if self.path == "/" or self.path == "/index.html":

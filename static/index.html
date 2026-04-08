@@ -32,6 +32,7 @@
             <div class="progress" id="progress" hidden>
                 <div class="spinner"></div>
                 <p id="progressText">Processing document...</p>
+                <button class="btn-stop" id="stopBtn">Stop</button>
             </div>
         </div>
 
@@ -75,6 +76,10 @@
         const resultMarkdown = document.getElementById('resultMarkdown');
         const copyBtn = document.getElementById('copyBtn');
         const errorDiv = document.getElementById('error');
+        const stopBtn = document.getElementById('stopBtn');
+
+        let currentJobId = null;
+        let abortController = null;
 
         dropZone.addEventListener('dragover', (e) => {
             e.preventDefault();
@@ -104,7 +109,29 @@
             setTimeout(() => copyBtn.classList.remove('copied'), 1500);
         });
 
-        function processFile(file) {
+        stopBtn.addEventListener('click', async () => {
+            if (currentJobId && abortController) {
+                abortController.abort();
+                try {
+                    await fetch('/api/ocr/cancel', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({jobId: currentJobId})
+                    });
+                } catch (e) {}
+                abortController = null;
+                currentJobId = null;
+                stopBtn.style.display = 'none';
+                progressText.textContent = 'Stopped';
+            }
+        });
+
+        async function processFile(file) {
+            if (abortController) {
+                abortController.abort();
+                abortController = null;
+            }
+
             const isPDF = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
             const isImage = file.type.startsWith('image/');
 
@@ -134,31 +161,105 @@
             progress.hidden = false;
             splitView.hidden = true;
             errorDiv.hidden = true;
+            resultMarkdown.textContent = '';
+            stopBtn.style.display = 'inline-block';
 
             if (isPDF) {
-                progressText.textContent = 'Processing PDF (this may take a while for multiple pages)...';
+                progressText.textContent = 'Starting PDF processing...';
             } else {
-                progressText.textContent = 'Processing document...';
+                progressText.textContent = 'Starting image processing...';
             }
 
-            fetch('/api/ocr', {
-                method: 'POST',
-                body: formData
-            })
-            .then(res => res.json())
-            .then(data => {
-                progress.hidden = true;
-                if (data.success) {
-                    resultMarkdown.textContent = data.markdown;
-                    splitView.hidden = false;
-                } else {
-                    showError(data.error || 'Unknown error');
+            abortController = new AbortController();
+
+            try {
+                const response = await fetch('/api/ocr/stream', {
+                    method: 'POST',
+                    body: formData,
+                    signal: abortController.signal
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    showError(errorData.error || 'Processing failed');
+                    progress.hidden = true;
+                    stopBtn.style.display = 'none';
+                    return;
                 }
-            })
-            .catch(err => {
-                progress.hidden = true;
-                showError(err.message);
-            });
+
+                currentJobId = response.headers.get('X-Job-ID');
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+
+                    const messages = buffer.split('\n\n');
+                    buffer = messages.pop() || '';
+
+                    for (const msg of messages) {
+                        const lines = msg.split('\n');
+                        let eventType = null;
+                        let eventData = null;
+
+                        for (const line of lines) {
+                            if (line.startsWith('event:')) {
+                                eventType = line.slice(6).trim();
+                            } else if (line.startsWith('data:')) {
+                                try {
+                                    eventData = JSON.parse(line.slice(5).trim());
+                                } catch (e) {}
+                            }
+                        }
+
+                        if (eventType && eventData) {
+                            if (eventType === 'progress') {
+                                progressText.textContent = eventData.message || 'Processing...';
+                            } else if (eventType === 'chunk' || eventType === 'page_done') {
+                                resultMarkdown.textContent += eventData.markdown || '';
+                                progressText.textContent = 'Extracting text...';
+                            } else if (eventType === 'done') {
+                                resultMarkdown.textContent += eventData.markdown || '';
+                                progress.hidden = true;
+                                splitView.hidden = false;
+                                stopBtn.style.display = 'none';
+                                currentJobId = null;
+                                abortController = null;
+                            } else if (eventType === 'cancelled') {
+                                resultMarkdown.textContent += eventData.markdown || '';
+                                progress.hidden = true;
+                                splitView.hidden = false;
+                                stopBtn.style.display = 'none';
+                                currentJobId = null;
+                                abortController = null;
+                            } else if (eventType === 'error') {
+                                showError(eventData.error || 'Unknown error');
+                                progress.hidden = true;
+                                stopBtn.style.display = 'none';
+                                currentJobId = null;
+                                abortController = null;
+                            }
+                        }
+                    }
+                }
+            } catch (err) {
+                if (err.name === 'AbortError') {
+                    progress.hidden = true;
+                    splitView.hidden = false;
+                    stopBtn.style.display = 'none';
+                    progressText.textContent = 'Stopped';
+                } else {
+                    showError(err.message);
+                    progress.hidden = true;
+                    stopBtn.style.display = 'none';
+                }
+                currentJobId = null;
+                abortController = null;
+            }
         }
 
         function showError(msg) {

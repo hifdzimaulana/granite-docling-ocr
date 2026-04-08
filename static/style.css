@@ -139,6 +139,24 @@ main {
     to { transform: rotate(360deg); }
 }
 
+.btn-stop {
+    display: inline-block;
+    margin-top: 1rem;
+    padding: 0.6rem 1.5rem;
+    background: #e53e3e;
+    color: white;
+    border: none;
+    border-radius: 6px;
+    font-size: 0.9rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.15s ease;
+}
+
+.btn-stop:hover {
+    background: #c53030;
+}
+
 .split-view {
     display: grid;
     grid-template-columns: 1fr 1fr;
