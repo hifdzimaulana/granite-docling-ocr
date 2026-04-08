@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Granite Docling OCR</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <header>
+        <h1>Granite Docling OCR</h1>
+        <p>Local VLM document extraction using MLX</p>
+    </header>
+
+    <main>
+        <div class="upload-section">
+            <div class="prompt-section">
+                <label for="promptInput">Custom Prompt (optional):</label>
+                <input type="text" id="promptInput" placeholder="e.g., Extract all tables, Summarize this, or leave empty for default">
+                <p class="hint">Leave empty to use default: "Convert this page to docling"</p>
+            </div>
+
+            <div class="drop-zone" id="dropZone">
+                <div class="drop-content">
+                    <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/>
+                    </svg>
+                    <p>Drag & drop a PDF or image, or <label for="fileInput">browse</label></p>
+                    <input type="file" id="fileInput" accept="image/*,.pdf" hidden>
+                </div>
+            </div>
+            <div class="progress" id="progress" hidden>
+                <div class="spinner"></div>
+                <p id="progressText">Processing document...</p>
+            </div>
+        </div>
+
+        <div class="split-view" id="splitView" hidden>
+            <div class="panel image-panel">
+                <div class="panel-header">
+                    <h2>Original Image</h2>
+                </div>
+                <div class="panel-content">
+                    <img id="previewImage" alt="Uploaded document">
+                </div>
+            </div>
+
+            <div class="panel result-panel">
+                <div class="panel-header">
+                    <h2>Extracted Text (Markdown)</h2>
+                    <button class="btn-copy" id="copyBtn" title="Copy to clipboard">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                        </svg>
+                        Copy
+                    </button>
+                </div>
+                <div class="panel-content">
+                    <pre id="resultMarkdown"></pre>
+                </div>
+            </div>
+        </div>
+
+        <div class="error" id="error" hidden></div>
+    </main>
+
+    <script>
+        const dropZone = document.getElementById('dropZone');
+        const fileInput = document.getElementById('fileInput');
+        const progress = document.getElementById('progress');
+        const progressText = document.getElementById('progressText');
+        const splitView = document.getElementById('splitView');
+        const previewImage = document.getElementById('previewImage');
+        const resultMarkdown = document.getElementById('resultMarkdown');
+        const copyBtn = document.getElementById('copyBtn');
+        const errorDiv = document.getElementById('error');
+
+        dropZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dropZone.classList.add('dragover');
+        });
+
+        dropZone.addEventListener('dragleave', () => {
+            dropZone.classList.remove('dragover');
+        });
+
+        dropZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropZone.classList.remove('dragover');
+            const file = e.dataTransfer.files[0];
+            if (file) processFile(file);
+        });
+
+        fileInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) processFile(file);
+        });
+
+        copyBtn.addEventListener('click', async () => {
+            const text = resultMarkdown.textContent;
+            await navigator.clipboard.writeText(text);
+            copyBtn.classList.add('copied');
+            setTimeout(() => copyBtn.classList.remove('copied'), 1500);
+        });
+
+        function processFile(file) {
+            const isPDF = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
+            const isImage = file.type.startsWith('image/');
+
+            if (!isPDF && !isImage) {
+                showError('Please upload a PDF or image file');
+                return;
+            }
+
+            if (isImage) {
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    previewImage.src = e.target.result;
+                };
+                reader.readAsDataURL(file);
+            } else {
+                previewImage.src = '';
+                previewImage.alt = 'PDF document (preview not available)';
+            }
+
+            const formData = new FormData();
+            formData.append('image', file);
+            const prompt = document.getElementById('promptInput').value.trim();
+            if (prompt) {
+                formData.append('prompt', prompt);
+            }
+
+            progress.hidden = false;
+            splitView.hidden = true;
+            errorDiv.hidden = true;
+
+            if (isPDF) {
+                progressText.textContent = 'Processing PDF (this may take a while for multiple pages)...';
+            } else {
+                progressText.textContent = 'Processing document...';
+            }
+
+            fetch('/api/ocr', {
+                method: 'POST',
+                body: formData
+            })
+            .then(res => res.json())
+            .then(data => {
+                progress.hidden = true;
+                if (data.success) {
+                    resultMarkdown.textContent = data.markdown;
+                    splitView.hidden = false;
+                } else {
+                    showError(data.error || 'Unknown error');
+                }
+            })
+            .catch(err => {
+                progress.hidden = true;
+                showError(err.message);
+            });
+        }
+
+        function showError(msg) {
+            errorDiv.textContent = msg;
+            errorDiv.hidden = false;
+        }
+    </script>
+</body>
+</html>

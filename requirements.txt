@@ -1,0 +1,6 @@
+mlx-vlm==0.3.3
+mlx-lm==0.23.0
+transformers==4.53.0
+docling-core
+pillow
+pymupdf
